@@ -1,0 +1,7 @@
+numpy
+pydes
+sha256
+khmer
+reedsolo
+crc8
+crcmod
