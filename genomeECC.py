@@ -1,15 +1,10 @@
-from utils import *
-from test_utils import *
-from chromosomeChunk import ChromosomeChunk
-import numpy as np
-import array
-from reedsolo import RSCodec, ReedSolomonError
-import zlib
-import crc16pure
-from hashlib import md5
-import crc8
+import logging
 import re
+
 from chromosomeECC import ChromosomeECC
+
+logger = logging.getLogger(__name__)
+
 
 class GenomeECC:
     def __init__(self, block_len=300, chunk_size=10, redundant_block_rate=0.04):
@@ -22,10 +17,20 @@ class GenomeECC:
         self.genome_seqs = {}
         self.chr_ECC_objs = {}
         self.chr_ecc_arr = []
+        # Full '>' header per chromosome id, kept so circular-chromosome detection can
+        # look at the description rather than the bare accession.
+        self.chr_headers = {}
+
+    @property
+    def chr_num(self):
+        # Was a plain attribute set only by read_genome(), so genome_ecc() raised
+        # AttributeError after read_chromosome()/add_chromosome().
+        return len(self.genome_seqs)
 
     def read_genome(self, file):
+        self.genome_seqs = {}
+        self.chr_headers = {}
         self.genome_seqs = self.read_fasta(file)
-        self.chr_num = len(self.genome_seqs)
 
     def read_chromosome(self, file):
         chro_seqs = self.read_fasta(file)
@@ -41,9 +46,11 @@ class GenomeECC:
 
 
     def genChromesomeECC(self, head_info, seq):
-        circular_chr = False
-        if 'circular' in head_info:
-            circular_chr = True
+        # head_info is the chromosome id; the 'circular' keyword lives in the full FASTA
+        # description, so consult that when we have it. Guarded against None, which used
+        # to raise TypeError on any header without a |...| accession.
+        full_header = self.chr_headers.get(head_info) or (head_info or '')
+        circular_chr = 'circular' in full_header.lower()
         aChrECC = ChromosomeECC(self.block_len, self.chunk_size, self.redundant_block_rate)
         aChrECC.circular_DNA = circular_chr
         aChrECC.set_chr_seq(seq)
@@ -78,60 +85,59 @@ class GenomeECC:
 
     def genomeEcc_to_chromosomeECC_arr(self, ecc_bytes):
         chr_num = int.from_bytes(ecc_bytes[:1], 'big', signed=False)
-        print("Total number of ECC bytes: ", end='')
-        print(len(ecc_bytes))
-        print("Chrosome num: ", end='')
-        print(chr_num)
-
+        logger.debug("Total ECC bytes: %d, chromosomes: %d", len(ecc_bytes), chr_num)
 
         chr_ecc_arr = []
         curr_pos = 1
         for i in range(0, chr_num):
             b_len = int.from_bytes(ecc_bytes[curr_pos:curr_pos+4], 'big', signed=False)
-            print("Current chrosome ECC length: ", end='')
-            print(b_len)
-            print("Current pos: ", end='')
-            print(curr_pos)
-
+            logger.debug("chromosome %d: ECC length %d at pos %d", i, b_len, curr_pos)
             chr_ecc_arr.append(ecc_bytes[curr_pos+4:curr_pos+4+b_len])
             curr_pos = curr_pos + 4 + b_len
         self.chr_ecc_arr = chr_ecc_arr
 
     def read_fasta(self, file):
-        f = open(file, "r")
+        # Rewritten: the previous "while line.strip()" loop exited at the first blank
+        # line, silently truncating multi-record genomes, and built each sequence with
+        # repeated string concatenation (quadratic on multi-Mbp chromosomes).
         seq_hash = {}
-        seqs = []
-        matchLineA = re.compile('^(>)')
+        seq_name = None
+        header = ''
+        parts = []
 
-        line = f.readline()
-        seq = ''
-        seq_name = ''
-        while line.strip():
-            if not matchLineA.match(line):
-                seq = seq + line.strip()
-            else:
-                if seq != '':
-                    seqs.append(seq)
-                    seq_hash[seq_name] = seq
-                    seq = ''
-                seq_name = self.extract_id(line)
-            line = f.readline()
-        f.close()
-        if seq != '':
-            seqs.append(seq)
-            seq_hash[seq_name] = seq
+        def flush():
+            # Merges rather than resets, so read_chromosome() can accumulate records
+            # across several files.
+            if seq_name is not None and parts:
+                seq_hash[seq_name] = ''.join(parts)
+                self.chr_headers[seq_name] = header
+
+        with open(file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('>'):
+                    flush()
+                    parts = []
+                    header = line
+                    seq_name = self.extract_id(line)
+                    if seq_name is None or seq_name in seq_hash:
+                        seq_name = line[1:].split()[0] if len(line) > 1 else 'seq_%d' % len(seq_hash)
+                    while seq_name in seq_hash:
+                        seq_name += '_dup'
+                else:
+                    parts.append(line)
+            flush()
         return seq_hash
 
     def extract_id(self, input_string):
-        # Define a regular expression pattern to match the ID
-        pattern = r'\|([^\|]+)\|'
-        # Use re.search to find the first match in the input string
-        match = re.search(pattern, input_string)
-        # Check if a match is found
+        # Prefer a |...| accession field, else fall back to the first token of the
+        # header. Returning None for anything without pipes meant every standard NCBI
+        # record ('>NC_000913.3 Escherichia coli ...') collapsed onto the same None key,
+        # silently keeping only the last chromosome of a multi-chromosome genome.
+        match = re.search(r'\|([^\|]+)\|', input_string)
         if match:
-            # Group 1 of the match contains the ID
-            id_value = match.group(1)
-            return id_value
-        else:
-            # Return None if no match is found
-            return None
+            return match.group(1)
+        token = input_string.lstrip('>').split()
+        return token[0] if token else None

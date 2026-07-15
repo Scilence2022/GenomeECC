@@ -1,15 +1,36 @@
 from utils import *
 from DNAdroplet import DNADroplet
-import khmer
 from chromosomeECC import ChromosomeECC
 from chromosomeChunk import ChromosomeChunk
 import crc16pure
 import crc8
 
+# khmer is an optional dependency: it has no wheels for Python >= 3.11 and fails to
+# build there. Importing it at module scope meant `import deBruijnGraph` -- and, via a
+# stale import in chromosomeChunk, the entire core ECC pipeline -- died on install.
+# Only the k-mer/assembly features below actually need it, so it is resolved on demand.
+try:
+    import khmer
+except ImportError:  # pragma: no cover - depends on the environment
+    khmer = None
+
+_KHMER_HINT = (
+    "DeBruijnGraph requires the optional 'khmer' package, which is unavailable on "
+    "Python >= 3.11. Install it on Python <= 3.10 (pip install 'genomeecc[assembly]'), "
+    "or use the ChromosomeECC/GenomeECC ECC pipeline, which does not need khmer."
+)
+
+
+def _require_khmer():
+    if khmer is None:
+        raise ImportError(_KHMER_HINT)
+    return khmer
+
+
 class DeBruijnGraph:
     def __init__(self, kmer_len=31):
         self.kmer_len = kmer_len
-        self.counts = khmer.Counttable(kmer_len, 1e8, 4)
+        self.counts = _require_khmer().Counttable(kmer_len, 1e8, 4)
 
         self.p_kmer = {}
         self.p_cov = 0
@@ -45,7 +66,7 @@ class DeBruijnGraph:
 
     def set_kmer_len(self, km_len, size=1e8, table_num=4):
         self.kmer_len = km_len
-        self.counts = khmer.Counttable(km_len, size, table_num)
+        self.counts = _require_khmer().Counttable(km_len, size, table_num)
 
     def set_ecc_mode(self, mode):
         if mode == 'crc8':
