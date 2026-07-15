@@ -1,7 +1,8 @@
-import sys
+import logging
+
 from utils import xor
 
-sys.setrecursionlimit(100000)
+logger = logging.getLogger(__name__)
 
 
 class Glass:
@@ -10,45 +11,41 @@ class Glass:
         self.droplets = []
         self.num_chunks = num_chunks
         self.chunks = [None] * num_chunks
-        
+
     def addDroplet(self, d):
         self.droplets.append(d)
-        entry = [d.get_chunk_nums(), d.data]
+        # list(...) copies: the entry used to alias the droplet's own chunk_num_list, so
+        # peeling entries during decode mutated the droplet's state as a side effect.
+        chunk_nums = d.get_chunk_nums()
+        entry = [list(chunk_nums) if chunk_nums else [], d.data]
         self.entries.append(entry)
         #self.updateEntry(entry)
 
     def decode(self):
-        if len(self.droplets) > 10:
-            solved_blocks_count = 0
-            iteration_solved_count = 0
-            while iteration_solved_count > 0 or solved_blocks_count == 0:
-                iteration_solved_count = 0
-                for i, entry in enumerate(self.entries):
-                    if len(entry[0]) == 1:
-                        iteration_solved_count += 1
-                        entry_index = next(iter(entry[0]))
-                        # if self.chunks[entry_index] is not None:
-                        #     assert self.chunks[entry_index] == entry[1], "Wrong droplet detected!"
-                        self.chunks[entry_index] = entry[1]
+        """Peel degree-1 droplets until no further progress is possible.
 
-                        self.entries.pop(i)
-
-                        solved_blocks_count += 1
-                        self.detach_entry(entry)
-        else:
-            print('Too few droplets!')
-
-            # Try to recover more droplets
-            # arr_in_arr
-            # for i, entry_i in enumerate(self.entries):
-            #     for j, entry_j in enumerate(self.entries):
-            #         if arr_in_arr(entry_i[0], entry_j[0]) and len(entry_j[0]) - len(entry_i[0]) == 1:
-            #             iteration_solved_count += 1
-            #             entry_j[1] = xor(entry_j[1], entry_i[1])
-            #             for e in entry_i[0]:
-            #                 entry_j[0].remove(e)
-            #             self.chunks[ next(iter(entry_j[0])) ] = entry_j[1]
-            #             self.entries.pop(j)
+        Returns True if every chunk was recovered.
+        """
+        # Rewritten. The old loop condition (`while iteration_solved_count > 0 or
+        # solved_blocks_count == 0`) spun forever when no degree-1 droplet was ever
+        # present, it popped from self.entries while enumerating it (skipping entries),
+        # and it refused to decode at all with <= 10 droplets.
+        progress = True
+        while progress:
+            progress = False
+            # Reverse order so pop(i) cannot shift an index we have yet to visit.
+            for i in range(len(self.entries) - 1, -1, -1):
+                entry = self.entries[i]
+                if len(entry[0]) == 1:
+                    entry_index = next(iter(entry[0]))
+                    self.chunks[entry_index] = entry[1]
+                    self.entries.pop(i)
+                    self.detach_entry(entry)
+                    progress = True
+        if not self.isDone():
+            logger.info("decode incomplete: %d/%d chunks recovered from %d droplets",
+                        self.chunksDone(), self.num_chunks, len(self.droplets))
+        return self.isDone()
 
     def detach_entry(self, entry):
         for other_entry in self.entries:
@@ -70,7 +67,8 @@ class Glass:
                     self.updateEntry(d)
                     
     def getString(self):
-        return ''.join(x or ' _ ' for x in self.chunks)
+        # chunks hold bytes, so ''.join() raised TypeError for any decoded glass.
+        return b''.join(x if x else b' _ ' for x in self.chunks)
         
     def isDone(self):
         return None not in self.chunks
@@ -91,10 +89,11 @@ class Glass:
 
 
     def writeToFile(self, output_file):
-        OUT = open(output_file, 'wb')
-        i = 0
-        while i < self.num_chunks:
-            OUT.write(self.chunks[i])
-            i = i + 1
-        OUT.close()
+        if not self.isDone():
+            raise ValueError(
+                "cannot write output: %d of %d chunks are still unrecovered"
+                % (self.num_chunks - self.chunksDone(), self.num_chunks))
+        with open(output_file, 'wb') as OUT:
+            for chunk in self.chunks:
+                OUT.write(chunk)
         return True

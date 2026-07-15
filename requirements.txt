@@ -1,7 +1,17 @@
-numpy
-pydes
-sha256
-khmer
-reedsolo
-crc8
-crcmod
+# Runtime dependencies for the ECC pipeline (ChromosomeECC / GenomeECC / genome-ecc CLI).
+# Lower bounds only; see pyproject.toml for the authoritative metadata.
+numpy>=1.21
+reedsolo>=1.5.4
+crc8>=0.2.1
+crcmod>=1.7
+
+# --- Optional, intentionally NOT installed by default -------------------------------
+# khmer: used only by deBruijnGraph.py (k-mer counting / read assembly). It has no
+#   wheels for Python >= 3.11 and fails to build there, so it must not gate the ECC
+#   pipeline. On Python <= 3.10 install with:  pip install '.[assembly]'
+# pyDes: used only by the legacy DES helpers in utils.py. DES is insecure and these are
+#   kept only to read data encoded by older versions:  pip install '.[legacy-crypto]'
+#
+# Removed from this list:
+#   sha256 - a third-party reimplementation of a stdlib primitive. utils.py now uses
+#            hashlib.sha256 from the standard library instead.

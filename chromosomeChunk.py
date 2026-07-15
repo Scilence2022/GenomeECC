@@ -1,15 +1,6 @@
 from utils import *
-from DNAdroplet import DNADroplet
-import khmer
-import numpy as np
-import array
-from reedsolo import RSCodec, ReedSolomonError
-# rsc = RSCodec(10)  # 10 ecc symbols
-import zlib
 import crc16pure
 import crc8
-from hashlib import md5
-
 
 
 class ChromosomeChunk:
@@ -50,19 +41,19 @@ class ChromosomeChunk:
         self.chunk_len = self.block_len * self.chunk_size
 
     def check_block_crc(self, block_seq):
-        block_bytes = bytesToDNA(block_seq)
+        # block_seq is DNA whose trailing ecc_byte_num bytes carry the block's CRC.
+        # This used to call bytesToDNA (the wrong direction, raising TypeError) and
+        # then compare an int against bytes, which is never equal.
+        block_bytes = DNAToBytes(block_seq)
+        payload = block_bytes[:-self.ecc_byte_num]
+        stored = block_bytes[-self.ecc_byte_num:]
         if self.ecc_mode == 'crc16':
-            if crc16pure.crc16xmodem(block_bytes[:-self.ecc_byte_num]) == block_bytes[-self.ecc_byte_num:]:
-                return True
-            else:
-                return False
+            expected = crc16pure.crc16xmodem(payload).to_bytes(self.ecc_byte_num, 'big', signed=False)
+        elif self.ecc_mode == 'crc8':
+            crc8_obj = crc8.crc8()
+            crc8_obj.update(payload)
+            expected = crc8_obj.digest()
         else:
-            if self.ecc_mode == 'crc8':
-                crc8_obj = crc8.crc8()
-                crc8_obj.update(block_bytes[:-self.ecc_byte_num])
-
-                if crc8_obj.digest() == block_bytes[-self.ecc_byte_num:]:
-                    return True
-                else:
-                    return False
+            raise ValueError("unknown ecc_mode %r" % (self.ecc_mode,))
+        return expected == stored
         # def get_block_ecc(self, block)

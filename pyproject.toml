@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genomeecc"
+version = "0.2.0"
+description = "Error-correcting codes for whole-genome DNA data preservation"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Lifu Song" }]
+keywords = ["DNA", "genome", "error-correcting-codes", "reed-solomon", "fountain-codes", "DNA-storage"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+dependencies = [
+    "numpy>=1.21",
+    "reedsolo>=1.5.4",
+    "crc8>=0.2.1",
+    "crcmod>=1.7",
+]
+
+[project.optional-dependencies]
+# khmer has no wheels for Python >= 3.11 and fails to build there. Only DeBruijnGraph
+# (k-mer counting / read assembly) needs it; the ECC pipeline does not.
+assembly = ["khmer>=3.0.0a3; python_version < '3.11'"]
+# DES helpers, kept only to read data encoded by older versions. See README.
+legacy-crypto = ["pyDes>=2.0.1"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+genome-ecc = "genome_ecc_cli:main"
+
+[tool.setuptools]
+py-modules = [
+    "utils", "test_utils", "chromosomeECC", "genomeECC", "chromosomeChunk",
+    "deBruijnGraph", "DNAdroplet", "DNAfountain", "droplet", "fountain",
+    "glass", "crc16pure", "genome_ecc_cli",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# test_utils.py is a helper library, not a test module, despite its name. Without this
+# pytest collects it and errors while trying to run its helpers as tests.
+python_files = ["test_*.py"]
+norecursedirs = ["genomes", ".git", ".claude"]
+addopts = "-q"
