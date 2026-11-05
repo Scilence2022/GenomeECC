@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genomeecc"
-version = "0.2.0"
+version = "0.3.0"
 description = "Error-correcting codes for whole-genome DNA data preservation"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -18,15 +18,12 @@ classifiers = [
 
 dependencies = [
     "numpy>=1.21",
-    "reedsolo>=1.5.4",
+    "reedsolo>=1.7,<2",
     "crc8>=0.2.1",
-    "crcmod>=1.7",
 ]
 
 [project.optional-dependencies]
-# khmer has no wheels for Python >= 3.11 and fails to build there. Only DeBruijnGraph
-# (k-mer counting / read assembly) needs it; the ECC pipeline does not.
-assembly = ["khmer>=3.0.0a3; python_version < '3.11'"]
+# Install the optional assembly backend from Bioconda as documented in README.
 # DES helpers, kept only to read data encoded by older versions. See README.
 legacy-crypto = ["pyDes>=2.0.1"]
 dev = ["pytest>=7.0"]
@@ -38,7 +35,8 @@ genome-ecc = "genome_ecc_cli:main"
 py-modules = [
     "utils", "test_utils", "chromosomeECC", "genomeECC", "chromosomeChunk",
     "deBruijnGraph", "DNAdroplet", "DNAfountain", "droplet", "fountain",
-    "glass", "crc16pure", "genome_ecc_cli",
+    "glass", "crc16pure", "genome_ecc_cli", "ecc_format", "ecc_archive",
+    "fasta", "fountain_codec",
 ]
 
 [tool.pytest.ini_options]

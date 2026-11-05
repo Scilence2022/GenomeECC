@@ -2,7 +2,6 @@ import hashlib
 import random
 import math
 import numpy as np
-from random import choices
 
 # pyDes is imported lazily by des_en/des_de. Importing it at module scope makes an
 # optional, rarely-used cipher a hard requirement for `from utils import *`, which every
@@ -45,21 +44,16 @@ def get_degrees(N, k, symbol_index=-1, delta=0.1, c_value=0.2, distribution_name
 	elif distribution_name == "robust":
 		probabilities = robust_distribution(N, c_value, delta)
 	else:
-		probabilities = None
+		raise ValueError(f"unknown degree distribution {distribution_name!r}")
 
 	population = list(range(0, N))
-	if symbol_index > 0:
-		random.seed(symbol_index)
-	#Not initialized yet
-	else:
+	if symbol_index <= 0:
 		return -1
-	return choices(population, probabilities, k=k)
+	return random.Random(symbol_index).choices(population, probabilities, k=k)
 
 
 def generate_chunk_nums(blocks_quantity, degree, symbol_index):
-	random.seed(symbol_index)
-	indexes = random.sample(range(blocks_quantity), degree[0])
-	return indexes
+	return random.Random(symbol_index).sample(range(blocks_quantity), degree[0])
 
 
 def ideal_distribution(K):
@@ -85,19 +79,27 @@ def robust_distribution(K, c_value = 0.5, robust_failure_probability=0.1):
 	# reproducibility -- see README "Known deviations".
 	if K < 2:
 		raise ValueError("robust_distribution needs K >= 2, got %r" % (K,))
+	if not math.isfinite(c_value) or c_value <= 0:
+		raise ValueError("c_value must be positive and finite")
+	if not 0 < robust_failure_probability < 1:
+		raise ValueError("failure probability must be in (0, 1)")
 
 	S = c_value * math.log(K / robust_failure_probability) * math.sqrt(K)
-	M = round(K / S)
+	if not math.isfinite(S) or S <= 0:
+		raise ValueError("soliton scale must be positive and finite")
+	M = K if S < 1 else round(K / S)
 
 	# M > K used to build an over-long extra_proba and die in np.add with an opaque
 	# broadcast error; M < 2 produced an empty tau. Clamp so the spike stays in range.
 	M = min(max(M, 2), K)
 
 	extra_proba = [0] + [1/(i * M) for i in range(1, M-1)]
-	extra_proba += [S * math.log(S / robust_failure_probability) / K]  # Spike at M
+	extra_proba += [max(0, S / K * (math.log(S) - math.log(robust_failure_probability)))]
 	extra_proba += [0 for k in range(M, K)]
 
 	probabilities = np.add(extra_proba, ideal_distribution(K))
+	if not np.isfinite(probabilities).all():
+		raise ValueError("soliton weights must be finite")
 	probabilities /= np.sum(probabilities)
 	#probabilities_sum = np.sum(probabilities)
 	#assert probabilities_sum >= 1 - epsilonc and probabilities_sum <= 1 + epsilonc, "The robust distribution should be standardized"
@@ -384,9 +386,7 @@ def reverse_sort_bytes_by_order(byte_string, order):
 	return bytes(original)
 
 def rand_order(max_num, rd_seed):
-	list = range(0, max_num)
-	random.seed(rd_seed)
-	return random.sample(list, max_num)
+	return random.Random(rd_seed).sample(range(max_num), max_num)
 
 def ratio(num1, num2):
 	if num1 > num2:

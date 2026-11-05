@@ -1,172 +1,168 @@
 # GenomeECC
 
-Error-correcting codes (ECC) for **whole-genome DNA data preservation**.
+GenomeECC creates separate error-correction archives for DNA sequences. It packs
+A/C/G/T into two bits per base, stores anchors and per-block checksums, and applies
+Reed–Solomon protection across columns of sequence blocks.
 
-A genome stored in a living cell, or synthesised as DNA, accumulates damage: bases
-mutate, stretches drop out, reads fail. GenomeECC generates a small, separate ECC file
-that lets a damaged genome be reconstructed exactly. The ECC file for a 3.3 Mbp genome
-is ~50 KB (about 6% of the packed sequence) and can restore whole erased blocks.
+## Installation
 
-There is also a **DNA fountain code** subsystem (Luby-transform droplets over DNA) for
-general-purpose DNA data storage, plus a De Bruijn graph assembler for recovering
-droplets from sequencing reads.
-
----
-
-## Install
-
-```bash
-pip install -e .                  # ECC pipeline + CLI
-pip install -e '.[dev]'           # + pytest
-pip install -e '.[assembly]'      # + khmer, for deBruijnGraph (Python <= 3.10 only)
+```sh
+python -m pip install -e .
+python -m pip install -e '.[dev]'
 ```
 
-`khmer` has no wheels for Python >= 3.11 and fails to build there. It is required
-**only** by `deBruijnGraph.py`; the ECC pipeline does not need it.
+Core encoding, verification, and recovery from known blocks require Python 3.9
+or newer. Optional read assembly uses khmer. A tested configuration uses the
+Bioconda khmer 3.0.0a3 build with Python 3.11.
 
-## Quick start
+```sh
+conda create -n genomeecc-assembly --override-channels -c conda-forge -c bioconda \
+  --strict-channel-priority python=3.11 khmer=3.0.0a3
+conda activate genomeecc-assembly
+python -m pip install -e '.[dev]'
+```
 
-```bash
-# Generate ECC codes for a genome
+[Bioconda builds by platform](https://anaconda.org/channels/bioconda/packages/khmer/files)
+
+## Encode and verify
+
+```sh
 genome-ecc encode -g genomes/cgl-ssbl-from_nxm.fna -o genome.ecc \
-    --block-len 320 --chunk-size 10 --redundancy 0.04
-
-# Describe an existing ECC file
+  --block-len 320 --chunk-size 10 --redundancy 0.04
 genome-ecc info -e genome.ecc
-
-# Check an ECC file still matches its genome
-genome-ecc verify -g genomes/cgl-ssbl-from_nxm.fna -e genome.ecc \
-    --block-len 320 --chunk-size 10 --redundancy 0.04
+genome-ecc verify -e genome.ecc -g genomes/cgl-ssbl-from_nxm.fna
+genome-ecc verify -e genome.ecc -g genomes/cgl-ssbl-from_nxm.fna --exact
 ```
 
-As a library:
+The default v2 archive records FASTA IDs, titles, topology, per-record SHA-256,
+and the boundaries of independent RS groups. `info` validates the file layout
+and the v2 archive checksum. `verify` compares the reference sequences with the
+stored digests and uses the archived parameters. With `--exact`, verification
+also regenerates the stored group bytes. Legacy records are matched by order,
+and historical padding differences can cause an exact comparison to fail after
+sequence verification succeeds.
+
+FASTA input accepts upper- and lowercase A/C/G/T. Output normalizes bases to
+uppercase. Duplicate IDs, empty records, and other nucleotide symbols produce an
+error with input context. Put `topology=circular` or `topology=linear` in the
+record description to specify topology explicitly.
+
+## Recover
+
+Given positioned blocks in a tab-separated file, run the following command.
+
+```sh
+genome-ecc recover -e genome.ecc --blocks candidates.tsv -o recovered.fna
+```
+
+Each TSV row contains the record ID, a zero-based block index within that record,
+and the DNA sequence. Use zero-based record numbers for legacy files. Leave out
+missing blocks or write `-` in the sequence column. Supply full block lengths,
+with the actual shorter length accepted for the final block. CRC failures count
+as erasures. The command replaces the destination after all records pass their
+sequence digest checks and reports missing and CRC-rejected blocks.
+
+For FASTQ or FASTA reads, install the optional k-mer backend and use `--reads`.
+The assembler searches from stored anchors and passes unambiguous candidates to
+the same recovery code. Legacy archives use linear topology for assembly.
+
+```sh
+genome-ecc recover -e genome.ecc --reads reads_R1.fq reads_R2.fq \
+  --kmer-size 31 --min-kmer-coverage 5 --max-paths 1000 -o recovered.fna
+```
+
+The default k-mer length is 31 or the shortest anchor width in bases, whichever
+is smaller. Insufficient coverage,
+repeats, and indels can leave blocks unresolved. The archive must have enough
+parity per group for the resulting errors and erasures.
+
+## Choose parameters
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--block-len` | 320 | Bases per block. Use a multiple of 4 in 4–1020. A multiple of 8 avoids column padding. |
+| `--chunk-size` | 10 | Blocks per anchor and CRC chunk, in 1–63. |
+| `--anchor-bytes` | 8 | Bytes per anchor, in 0–15 and within chunk capacity. Zero is useful for positioned block recovery. |
+| `--ecc-mode` | `crc8` | Per-block CRC mode. `crc16` uses two bytes and reduces accidental matches. |
+| `--redundancy` | 0.04 | Parity rate in 0–1. Zero provides checksum verification without recovery capacity. |
+| `--group-blocks` | 4096 | v2 group cap, rounded down to a whole number of chunks. |
+
+Every group contains one GF(2¹⁶) codeword per column. A data block occupies one
+symbol in each column. A group with `B` blocks and `R = ceil(rate × B)` parity
+symbols can correct `E` unknown symbol errors and `S` known erasures per column
+when `2E + S ≤ R`. The budget is separate for every group. A long contiguous
+deletion can exhaust one group's parity even if other groups have unused parity.
+A legacy single-codeword record requires `B + R ≤ 65,535`.
+
+On the repository's 3.28 Mbp sample, the default v2 configuration produced a
+51,631-byte archive in 7.4 seconds on one Apple M3 Max. The same parameters in
+the legacy genome layout produced 51,378 bytes in 19.7 seconds. Recovery from
+positioned blocks with 75 erased blocks took 21.2 seconds. These are single-run
+wall-clock measurements with Python 3.9.6 and reedsolo 1.7.0.
+
+## Legacy compatibility
+
+The CLI detects legacy genome containers and naked chromosome ECC files by
+checking the entire layout. Use `--format legacy-genome` or
+`--format legacy-chromosome` to choose an explicit legacy format. The
+`ChromosomeECC` and `GenomeECC` compatibility APIs also write legacy layouts.
+
+```sh
+genome-ecc info -e genomes/cgl-ssbl-from_nxm.fna.ecc
+genome-ecc migrate -e genomes/cgl-ssbl-from_nxm.fna.ecc \
+  -g genomes/cgl-ssbl-from_nxm.fna -o genome-v2.ecc
+```
+
+Migration checks the supplied reference against the historical digest and creates
+a new v2 archive with the selected encoding parameters. Historical files whose
+lengths disagree with their geometry, including old encodings that left a column
+unprotected, are rejected. Such archives need a trusted source sequence for
+re-encoding. The [binary format description](docs/ecc-format.md) specifies the
+fields and integrity checks.
+
+## DNA Fountain
+
+Use the manifest API for a byte-exact round trip from DNA strand strings.
 
 ```python
-from chromosomeECC import ChromosomeECC
+from fountain_codec import FountainManifest, decode_dna, encode_dna
 
-c = ChromosomeECC(block_len=320, chunk_size=10, redundant_block_rate=0.04)
-c.set_chr_seq(sequence)             # sequence is an ACGT string
-ecc_bytes = c.get_all_ecc_bytes()   # store this alongside the genome
+payload = b"example\x00"
+manifest, strands = encode_dna(payload, count=20, chunk_size=4, seed=11)
+manifest = FountainManifest.from_bytes(manifest.to_bytes())
+restored = decode_dna(manifest, strands)
+assert restored == payload
 ```
 
-## How it works
+The manifest records the source length, SHA-256, chunk size, seed, and schedule
+version. Decoding validates each strand's index and CRC32 and verifies the exact
+source bytes. The lower-level Glass decoder also supports incremental batches.
+Use a sufficient strand surplus
+for the intended loss model. `strand_filter` and `max_attempts` allow bounded
+screening for experimental sequence constraints.
 
-```
-genome (ACGT)
-  -> 2-bit packing            4 bases per byte (A=00 C=01 G=10 T=11)
-  -> blocks                   block_len bases each (block_size = block_len/4 bytes)
-  -> chunks                   chunk_size blocks each, each with an anchor + per-block CRCs
-  -> columns                  byte i of every block forms column i
-  -> Reed-Solomon per column  in GF(2^16), 2-byte symbols, one symbol per block
-```
+The versioned schedule preserves the historical nonstandard soliton weighting.
+It gives degree 1 additional mass, omits degree `K` for `K ≥ 2`, and places
+the robust spike one degree below the original formula. Existing seed vectors
+are covered by regression tests. [Original LT Codes paper](https://www.mit.edu/~6.454/www_fall_2003/khisti/luby02lit.pdf)
 
-The column transposition is the important idea: because each column holds exactly **one
-symbol per block**, losing an entire block costs every column exactly one symbol. A
-block erasure therefore becomes a single-symbol erasure in each column, which
-Reed-Solomon corrects independently. With `redundant_block_rate = r`, up to
-`ceil(r * block_num)` whole blocks can be erased and rebuilt exactly.
+Archived experimental scripts such as `Encode.py`, `decode.py`, and
+`genGenomeECC*.py` contain machine-specific inputs and older APIs. Use the
+supported CLI and manifest API for new runs. The opt-in DES code is retained for
+legacy droplet compatibility. It uses a key-derived permutation and the key as
+its CBC IV. Apply authenticated encryption to the source payload before fountain
+encoding if confidentiality or authenticity is required.
 
-The ECC file contains: genome length, MD5, block/chunk geometry, per-chunk anchors,
-per-block CRCs, and the RS parity for each column.
+## Tests
 
-## Choosing parameters
-
-| Parameter | Meaning | Notes |
-|---|---|---|
-| `--block-len` | bases per block | 4..1020 (10-bit field). A multiple of 8 keeps `block_size` even and avoids column padding. |
-| `--chunk-size` | blocks per chunk | 1..63 (6-bit field). |
-| `--redundancy` | RS redundant block rate | Directly sets how many whole blocks can be erased and recovered. |
-| `--ecc-mode` | per-block checksum | `crc8` (1 byte) or `crc16` (2 bytes). |
-
-Values outside those ranges now raise `ValueError` rather than silently corrupting the
-header.
-
-## Testing
-
-```bash
-pytest
+```sh
+python -m pytest
 ```
 
-97 tests cover the encode/decode round trip, RS erasure recovery at and beyond the
-correction limit, header packing, FASTA parsing, the codec, and the fountain decoder.
-
-## Performance
-
-On a real 3.28 Mbp genome (`genomes/cgl-ssbl-from_nxm.fna`, `block_len=320`):
-
-| Stage | Before | After |
-|---|---|---|
-| `set_chr_seq` (DNA->bytes, CRCs, anchors) | 12.75 s | **0.14 s** |
-| RS encode (third-party `reedsolo`) | 19.84 s | 19.87 s |
-| **Total** | **32.60 s** | **20.03 s** |
-
-`DNAToBytes` previously rebuilt a 256-entry lookup dict on every 4-base conversion; it
-is now a vectorised 2-bit pack (~2400x faster in isolation). The remaining runtime is
-almost entirely inside `reedsolo`'s pure-Python `rs_encode_msg`. If RS encoding
-dominates your workload, that library is the place to optimise.
-
-## Compatibility with previously generated .ECC files
-
-For a configuration the old code handled correctly (e.g. `block_len=320`, explicit
-`set_block_ecc_mode('crc8')`), the ECC output is unchanged except for **the final
-chunk's unused CRC padding**. A short final chunk has fewer real blocks than
-`chunk_size`; the old code filled the leftover slots by cyclically repeating earlier
-CRCs (a side effect of `np.resize`, which tiles rather than pads), so those slots held
-checksums for blocks that do not exist. They are now zero-filled. Reed-Solomon parity is
-byte-for-byte identical.
-
-Output **does** legitimately change where the old behaviour was broken — most
-importantly when `block_len` gives an odd `block_size` (the defaults 500 and 300 did),
-because the last byte of every block previously belonged to no column and was neither
-protected nor restored.
-
-## Known deviations from the published algorithms
-
-`utils.py` implements the Luby soliton distributions with **deliberate deviations**,
-preserved as-is so previously tuned experimental results stay reproducible. They are
-documented here rather than silently "corrected":
-
-- `ideal_distribution` uses `rho(1) = 10/K` instead of Luby's `1/K`, putting roughly 5x
-  more mass on degree 1 after normalisation, and `range(2, K)` means degree `K` is
-  never emitted.
-- `robust_distribution` places the tau spike at degree `M-1` rather than `M`, and tau
-  covers degrees `1..M-2` rather than `1..M-1`.
-
-Both still return correctly normalised distributions. If you want textbook Luby
-behaviour, change these two functions deliberately and re-run your experiments.
-
-## Security notes
-
-**Do not rely on this codebase for confidentiality.** The optional droplet encryption
-(`des=True`) is broken by design and kept only for compatibility:
-
-- It uses **DES**, which has a 56-bit key and has been considered broken since 1998.
-- `des_en`/`des_de` set the CBC **IV equal to the key**, making encryption
-  deterministic.
-- The byte permutation in `DNAdroplet` derives its seed from `index + key`, while
-  `index` is transmitted in plaintext and the CRC is computed over the ciphertext. That
-  combination is an unkeyed oracle: an attacker holding only a public droplet can
-  confirm a guessed key without any known plaintext. A working key-recovery
-  demonstration was produced during a security review of this repository.
-
-If you need real confidentiality, encrypt the payload with a modern AEAD (for example
-`cryptography`'s `AESGCM`) before it reaches this library, and never derive
-non-secret-looking state from the key.
-
-## Repository layout
-
-| File | Purpose |
-|---|---|
-| `chromosomeECC.py` | Core ECC for one chromosome (blocks, columns, RS, CRCs, anchors) |
-| `genomeECC.py` | Multi-chromosome wrapper, FASTA reading, ECC file packing |
-| `chromosomeChunk.py` | A chunk of blocks and its checksums |
-| `genome_ecc_cli.py` | `genome-ecc` command-line interface |
-| `utils.py` | DNA<->bytes codec, soliton distributions, GC/homopolymer checks |
-| `test_utils.py` | Helper/experiment library (**not** a test module, despite the name) |
-| `deBruijnGraph.py` | De Bruijn graph assembly; the only user of the optional `khmer` |
-| `DNAdroplet.py`, `DNAfountain.py`, `droplet.py`, `fountain.py`, `glass.py` | Fountain-code subsystem |
-| `genGenomeECC*.py` | Original experiment scripts, kept as a record. They contain absolute paths to the author's machine and are not runnable elsewhere -- use `genome-ecc` instead. |
-| `tests/` | pytest suite |
+The suite covers the core code, both legacy layouts, v2 groups, on-disk recovery,
+historical fixtures, malformed inputs, forward/reverse assembly, and real DNA
+fountain strings. The khmer integration test runs when khmer is installed. CI
+builds the distribution and runs the installed CLI outside the source tree.
 
 ## License
 

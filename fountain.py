@@ -1,58 +1,43 @@
-from droplet import Droplet
-from math import ceil
-from utils import *
+"""Shared chunk geometry and legacy soliton schedule for fountain encoding."""
 
-import random
+from utils import get_degrees
+
 
 class Fountain:
     def __init__(self, data=b'', chunk_size=35, index=1, seed=1):
+        if type(chunk_size) is not int or chunk_size <= 0:
+            raise ValueError("chunk size must be positive")
+        if type(seed) is not int or seed <= 0:
+            raise ValueError("fountain seed must be a positive integer")
+        if type(index) is not int or index < 0:
+            raise ValueError("initial droplet index must be a nonnegative integer")
         self.seed = seed
         self.index = index
         self.data = data
+        self.original_size = len(data)
         self.chunk_size = chunk_size
-        self.num_of_chunks = int(ceil(len(data) / float(chunk_size)))
-        #self.ROBUST_FAILURE_PROBABILITY = 0.1   #Large-Scale simulations
-        #self.c_value = 0.2  #Large-Scale simulations
-        self.ROBUST_FAILURE_PROBABILITY = 0.01 # 0.01
-        self.c_value = 0.01 #0.01
-
+        self.num_of_chunks = (len(data) + chunk_size - 1) // chunk_size
+        self.ROBUST_FAILURE_PROBABILITY = 0.01
+        self.c_value = 0.01
         self.degree_table_folds = 3
-        self.degrees = get_degrees(self.num_of_chunks, int(self.num_of_chunks * self.degree_table_folds), self.seed, self.ROBUST_FAILURE_PROBABILITY, self.c_value, 'robust')
-
         self.VERBOSE = False
-
-       # self.random_degrees = get_degrees_from("robust", blocks_n, k=drops_quantity)
-        #random.seed(seed)
-    #replaced by DNAdroplet in DNAFountain
-    # def droplet(self):
-    #     #self.updateSeed()
-    #     aDroplet = Droplet(b'', self.seed, self.num_of_chunks)
-    #     #return aDroplet
-    #     chunk_num_list = aDroplet.chunk_num_list
-    #     data = None
-    #     for num in chunk_num_list:
-    #         if data is None:
-    #             data = self.chunk(num)
-    #         else:
-    #             data = xor(data, self.chunk(num))
-    #     aDroplet.data = data
-    #     return aDroplet
+        self.gen_degrees()
 
     def chunk(self, num):
         start = self.chunk_size * num
-        end = min(self.chunk_size * (num+1), len(self.data))
-        return self.data[start:end]
+        return self.data[start:start + self.chunk_size]
 
     def updateIndex(self):
-        self.index = self.index + 1
+        self.index += 1
 
     def updateSeed(self):
-        self.seed = self.seed + 1
-       # self.seed = random.randint(0,2**31-1)
-        #random.seed(self.seed)
+        self.seed += 1
 
     def gen_degrees(self):
-        # Passed self.seed twice, giving get_degrees 7 positional args for its 6
-        # parameters -- an unconditional TypeError. Mirrors the __init__ call.
-        self.degrees = get_degrees(self.num_of_chunks, int(self.num_of_chunks * self.degree_table_folds), self.seed, self.ROBUST_FAILURE_PROBABILITY, self.c_value, 'robust')
- #   def openfile(self, str):
+        size = self.num_of_chunks * self.degree_table_folds
+        if self.num_of_chunks < 2:
+            self.degrees = [1] * size
+        else:
+            self.degrees = get_degrees(
+                self.num_of_chunks, size, self.seed, self.ROBUST_FAILURE_PROBABILITY, self.c_value,
+            )
