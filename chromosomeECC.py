@@ -1,527 +1,447 @@
-from utils import *
-from test_utils import *
-# from DNAdroplet import DNADroplet
-# import khmer
-from chromosomeChunk import ChromosomeChunk
-import numpy as np
-import array
-from reedsolo import RSCodec, ReedSolomonError
-import zlib
-import crc16pure
+"""Reed–Solomon protection for one independently encoded sequence or group."""
+
 from hashlib import md5
-import crc8
+import math
+from pathlib import Path
+from threading import RLock
+import zlib
+
+import numpy as np
+from reedsolo import RSCodec, ReedSolomonError
+
+from chromosomeChunk import ChromosomeChunk, block_crc
+from ecc_format import (
+    CRC_MODES, CRC_WIDTHS, MAX_CODEWORD, RS_POLYNOMIAL, ceil_div,
+    unpack_chromosome, validate_codeword, validate_geometry, validate_rate, write_atomic,
+)
+from utils import DNAToBytes, bytesToDNA
+
+
+# reedsolo 1.x uses module-global finite-field tables during construction and coding.
+_RS_LOCK = RLock()
+
 
 class ChromosomeECC:
-    def __init__(self, block_len=500, chunk_size=6, redundant_block_rate=0.03, block_ecc_mode='crc8', chunk_anchor_byte_num=8):
+    nsize = MAX_CODEWORD
+    colum_byte_num_per_block = 2
+
+    def __init__(self, block_len=500, chunk_size=6, redundant_block_rate=0.03,
+                 block_ecc_mode='crc8', chunk_anchor_byte_num=8):
         self.block_len = block_len
-        self.block_size = int(self.block_len/4)
+        self.block_size = block_len // 4
         self.chunk_size = chunk_size
-        self.chunk_len = self.block_len * self.chunk_size
+        self.chunk_len = block_len * chunk_size
         self.redundant_block_rate = redundant_block_rate
         self.chunk_anchor_byte_num = chunk_anchor_byte_num
-
-        self.DNA_seq = ''
-        self.DNA_seq_len = 0
         self.circular_DNA = True
+
+        self.DNA_seq_len = 0
         self.block_num = 0
         self.chunk_num = 0
-        self.colum_byte_num_per_block = 2
         self.redundant_block_num = 0
-
-        self.DNA_seq_bytes = b''
-        # block_ecc_byte_num must follow block_ecc_mode: crc8 digests are 1 byte. It was
-        # hardcoded to 2 while the default mode is 'crc8', so the packed header declared
-        # a 2-byte CRC width for 1-byte codes and every unpack misaligned.
-        self.block_ecc_mode = block_ecc_mode
-        self.block_ecc_byte_num = 2
+        self.ecc = None
+        self._clear_sequence()
         self.set_block_ecc_mode(block_ecc_mode)
-        self.block_crc_codes = [] #np.array(bytes(2))
-        # object dtype: np.array(bytes(4)) built an |S4 array that silently truncated
-        # any CRC32 ending in a NUL byte.
-        self.chunk_crc_codes = np.empty(0, dtype=object)
-        self.chunk_anchores = []
 
-
-        self.DNA_seq_bytes_md5 = ""
-        #md5(some_bytes).hexdigest()
-        self.ecc = RSCodec()
-        self.nsize = int(math.pow(2,16)) - 1 # 65535
-
+    def _clear_sequence(self):
+        self.DNA_seq = ''
+        self.DNA_seq_bytes = b''
+        self.DNA_seq_bytes_md5 = None
+        self.block_crc_codes = []
+        self.chunk_crc_codes = []
+        self._loaded_anchors = []
+        self.block_seqs = []
         self.block_bytes = []
         self.colum_bytes = []
         self.colum_rs_codes = []
-        self.block_seqs = []
 
-    def block_seqs_to_bytes(self):
-        self.block_bytes = []
-        for seq in self.block_seqs:
-            self.block_bytes.append(DNAToBytes(seq))
+    def _geometry(self, length, block_len, chunk_size):
+        validate_geometry(block_len, chunk_size, self.chunk_anchor_byte_num)
+        validate_rate(self.redundant_block_rate)
+        if type(length) is not int or not 0 < length < 2**32:
+            raise ValueError("chromosome length must be in 1..4294967295 bases")
+        blocks = ceil_div(length, block_len)
+        parity = math.ceil(self.redundant_block_rate * blocks)
+        validate_codeword(blocks, parity)
+        return blocks, parity
+
+    def _configure(self, length, blocks, parity):
+        self.DNA_seq_len = length
+        self.block_num = blocks
+        self.chunk_num = ceil_div(blocks, self.chunk_size)
+        self._set_parity(parity)
+
+    def _set_parity(self, parity):
+        self.redundant_block_num = parity
+        self.colum_rs_codes = []
+        self.ecc = None
+
+    def _codec(self):
+        if self.ecc is None:
+            self.ecc = RSCodec(
+                self.redundant_block_num, nsize=self.nsize, prim=RS_POLYNOMIAL,
+                generator=2, fcr=0, c_exp=16,
+            )
+        return self.ecc
 
     def set_chr_seq(self, seq):
+        blocks, parity = self._geometry(len(seq), self.block_len, self.chunk_size)
+        if self.block_ecc_mode not in CRC_WIDTHS:
+            raise ValueError(f"unknown block_ecc_mode {self.block_ecc_mode!r}")
+        packed = DNAToBytes(self.round_DNA(seq))
+        self._clear_sequence()
+        self._configure(len(seq), blocks, parity)
         self.DNA_seq = seq
-        self.DNA_seq_len = len(seq)
-        self.DNA_seq_bytes = DNAToBytes(self.round_DNA(self.DNA_seq))
-        self.block_num = math.ceil(self.DNA_seq_len/self.block_len)
-        self.chunk_num = math.ceil(self.DNA_seq_len/self.chunk_len)
-        # Reset derived state first: __block_crc and __encode_chunk_anchores append, so
-        # calling set_chr_seq twice used to double these lists.
-        self.block_crc_codes = []
-        self.chunk_anchores = []
-        self.block_bytes = []
-        self.colum_bytes = []
-        self.colum_rs_codes = []
-        self.chunk_crc_codes = np.empty(self.chunk_num, dtype=object)
-        self.__block_crc()
-        self.__chunk_crc()
-        self.__encode_chunk_anchores()
-
-        self.redundant_block_num = math.ceil(self.redundant_block_rate * self.block_num)
-        self.ecc = RSCodec(self.redundant_block_num, nsize=self.nsize)
-
+        self.DNA_seq_bytes = packed
+        self.chunk_crc_codes = [None] * self.chunk_num
+        self.get_block_crc(0)
 
     def set_chr_size(self, g_size):
-        # self.DNA_seq = seq
-        self.DNA_seq_len = g_size
-        # self.DNA_seq_bytes = DNAToBytes(self.round_DNA(self.DNA_seq))
-        self.block_num = math.ceil(self.DNA_seq_len/self.block_len)
-        self.chunk_num = math.ceil(self.DNA_seq_len/self.chunk_len)
-        # block_crc_codes is a plain list; .resize() is a numpy method and raised
-        # AttributeError here.
-        self.block_crc_codes = [b''] * self.block_num
-        self.chunk_crc_codes = np.empty(self.chunk_num, dtype=object)
-        # self.chunk_anchores.resize(self.chunk_num)
+        blocks, parity = self._geometry(g_size, self.block_len, self.chunk_size)
+        self._clear_sequence()
+        self._configure(g_size, blocks, parity)
+        self.chunk_crc_codes = [None] * self.chunk_num
 
-        self.redundant_block_num = math.ceil(self.redundant_block_rate * self.block_num)
-        self.ecc = RSCodec(self.redundant_block_num, nsize=self.nsize)
-
+    def _set_geometry(self, block_len, chunk_size):
+        validate_geometry(block_len, chunk_size, self.chunk_anchor_byte_num)
+        if self.DNA_seq_bytes_md5 is not None:
+            raise ValueError("cannot change the geometry of a loaded recovery context")
+        if self.DNA_seq_len:
+            self._geometry(self.DNA_seq_len, block_len, chunk_size)
+        same_blocks = self.block_len == block_len
+        self.block_len = block_len
+        self.block_size = block_len // 4
+        self.chunk_size = chunk_size
+        self.chunk_len = block_len * chunk_size
+        if self.DNA_seq:
+            if same_blocks:
+                self.chunk_num = ceil_div(self.block_num, chunk_size)
+                self.chunk_crc_codes = [None] * self.chunk_num
+            else:
+                self.set_chr_seq(self.DNA_seq)
+        elif self.DNA_seq_len:
+            self.set_chr_size(self.DNA_seq_len)
 
     def set_block_len(self, block_len):
-        self.block_len = block_len
-        self.block_size = int(self.block_len / 4)
-        # self.chunk_size = chunk_size
-        self.chunk_len = self.block_len * self.chunk_size
-
-    def set_block_ecc_mode(self, mode):
-        if mode == 'crc8':
-            self.block_ecc_byte_num = 1
-            self.block_ecc_mode = mode
-        elif mode == 'crc16':
-            self.block_ecc_byte_num = 2
-            self.block_ecc_mode = mode
-
-    # nsize must be carried through: rebuilding RSCodec without it silently dropped the
-    # code from GF(2^16) back to the 255-symbol default, which cannot address the
-    # 2-byte-per-block symbols this class encodes.
-    def set_redundant_block_rate(self, redundant_block_rate):
-        self.redundant_block_rate = redundant_block_rate
-        self.redundant_block_num = math.floor(redundant_block_rate*self.block_num)
-        self.ecc = RSCodec(self.redundant_block_num, nsize=self.nsize)
-
-    def set_redundant_block_num(self, redundant_block_num):
-        self.redundant_block_num = math.floor(redundant_block_num)
-        self.ecc = RSCodec(self.redundant_block_num, nsize=self.nsize)
-
+        self._set_geometry(block_len, self.chunk_size)
 
     def set_chunk_size(self, chunk_size):
-        self.chunk_size = chunk_size
-        ##
+        self._set_geometry(self.block_len, chunk_size)
+
+    def set_block_ecc_mode(self, mode):
+        if mode not in CRC_WIDTHS:
+            raise ValueError(f"unknown block_ecc_mode {mode!r}")
+        if self.DNA_seq_bytes_md5 is not None and mode != self.block_ecc_mode:
+            raise ValueError("cannot change the CRC mode of a loaded recovery context")
+        self.block_ecc_mode = mode
+        self.block_ecc_byte_num = CRC_WIDTHS[mode]
+        if self.DNA_seq:
+            self.block_crc_codes = []
+
+    def set_redundant_block_rate(self, redundant_block_rate):
+        validate_rate(redundant_block_rate)
+        self.set_redundant_block_num(math.ceil(redundant_block_rate * self.block_num))
+        self.redundant_block_rate = redundant_block_rate
+
+    def set_redundant_block_num(self, redundant_block_num):
+        validate_codeword(self.block_num, redundant_block_num)
+        if self.DNA_seq_bytes_md5 is not None and redundant_block_num != self.redundant_block_num:
+            raise ValueError("cannot change the parity of a loaded recovery context")
+        self._set_parity(redundant_block_num)
+        # This setter has historically made the codec immediately available to callers.
+        with _RS_LOCK:
+            self._codec()
+
+    @property
+    def chunk_anchores(self):
+        if self.DNA_seq:
+            return [self.get_chunk_anchor(i) for i in range(self.chunk_num)]
+        return self._loaded_anchors
 
     def get_chunk_anchor(self, chunk_id):
-        return self.chunk(chunk_id)[:self.chunk_anchor_byte_num]
-
+        if not self.DNA_seq:
+            return self._loaded_anchors[chunk_id]
+        return self.chunk(chunk_id)[:self.chunk_anchor_byte_num].ljust(self.chunk_anchor_byte_num, b'\0')
 
     def get_chunk_index(self, chunk_id):
-        if self.chunk_anchores[chunk_id]:
-            return self.chunk_anchores[chunk_id]
+        return self.get_chunk_anchor(chunk_id) or None
 
     def get_chunk_block_crc_codes(self, chunk_id):
         start = chunk_id * self.chunk_size
-        end = (chunk_id + 1) * self.chunk_size
-        if end > self.block_num:
-            # Pad the short final chunk with zero CRCs. np.resize tiled the existing
-            # codes cyclically instead of padding, and coerced them to a fixed-width
-            # bytes dtype that stripped any CRC ending in a NUL byte.
-            block_crc_codes = list(self.block_crc_codes[start:self.block_num])
-            filler = bytes(self.block_ecc_byte_num)
-            block_crc_codes += [filler] * (self.chunk_size - len(block_crc_codes))
-        else:
-            block_crc_codes = list(self.block_crc_codes[start:end])
-
-        return block_crc_codes
-
-    def __encode_chunk_anchores(self):
-        # Was hardcoded to 6 bytes while get_chunk_anchor (and the packed header) use
-        # chunk_anchor_byte_num, which defaults to 8 -- the two disagreed.
-        self.chunk_anchores = []
-        for i in range(0, self.chunk_num):
-            self.chunk_anchores.append(self.chunk(i)[0:self.chunk_anchor_byte_num])
+        end = min(start + self.chunk_size, self.block_num)
+        codes = [self.get_block_crc(i) for i in range(start, end)]
+        return codes + [bytes(self.block_ecc_byte_num)] * (self.chunk_size - len(codes))
 
     def round_DNA(self, dnaseq='', group_size=4):
-        # % group_size on the padding width: when the length was already aligned this
-        # appended a whole spurious group (4 bases), inflating DNA_seq_bytes by a byte
-        # and folding that byte into the stored MD5.
-        return dnaseq + ('A' * ((group_size - len(dnaseq) % group_size) % group_size))
-
+        return dnaseq + 'A' * (-len(dnaseq) % group_size)
 
     def chunk(self, chunk_id):
         start = self.chunk_size * chunk_id * self.block_size
-        end = min(self.chunk_size * self.block_size * (chunk_id + 1), len(self.DNA_seq_bytes))
-        return self.DNA_seq_bytes[start:end]
+        return self.DNA_seq_bytes[start:start + self.chunk_size * self.block_size]
 
     def chunk_seq(self, chunk_id):
         return bytesToDNA(self.chunk(chunk_id))
 
+    def block_seqs_to_bytes(self):
+        if len(self.block_seqs) != self.block_num:
+            raise ValueError(f"expected {self.block_num} blocks, got {len(self.block_seqs)}")
+        blocks = []
+        for i, sequence in enumerate(self.block_seqs):
+            actual_len = min(self.block_len, self.DNA_seq_len - i * self.block_len)
+            if len(sequence) not in (actual_len, self.block_len):
+                raise ValueError(f"block {i}: expected {actual_len} bases")
+            blocks.append(DNAToBytes(sequence[:actual_len].ljust(self.block_len, 'A')))
+        self.block_bytes = blocks
+        self.colum_bytes = []
+        self.colum_rs_codes = []
+
     def block(self, block_id):
-        if len(self.block_bytes) < self.block_num:
-            self._gen_block_bytes()
-        if block_id < self.block_num:
-            return self.block_bytes[block_id]
-        else:
+        if not 0 <= block_id < self.block_num:
             return b''
-
-    def _block_byte(self, block_id):
-        start = self.block_size * block_id
-        end = min(self.block_size * (block_id + 1), len(self.DNA_seq_bytes))
-        if end-start < self.block_size:
-            return self.DNA_seq_bytes[start:end] + bytes(self.block_size - (end-start) )
-        return self.DNA_seq_bytes[start:end]
-
-    def _gen_block_bytes(self):
-        self.block_bytes = []
-        for i in range(0, self.block_num):
-            self.block_bytes.append(self._block_byte(i))
-        # while len(self.block_bytes[-1]
-
+        if not self.block_bytes:
+            if not self.DNA_seq:
+                raise ValueError("no sequence blocks loaded")
+            packed = self.DNA_seq_bytes
+            size = self.block_size
+            self.block_bytes = [
+                packed[start:start + size].ljust(size, b'\0')
+                for start in range(0, len(packed), size)
+            ]
+        return self.block_bytes[block_id]
 
     def colum(self, colum_id):
-        #generating block_bytes
-        if len(self.colum_bytes) < self.colum_num():
+        if not self.colum_bytes:
             self.block_bytes_to_colum_bytes()
         return self.colum_bytes[colum_id]
 
-
     def colum_num(self):
-        # ceil, not int(): with the default block_len=500 the block is 125 bytes, and
-        # truncating 125/2 to 62 columns covered only 124 bytes. The last byte of every
-        # block was in no column at all -- neither RS-protected nor restored on
-        # reassembly -- silently losing 4 bases per block. Blocks are zero-padded up to
-        # colum_num()*colum_byte_num_per_block so every column still holds exactly one
-        # symbol per block, which is what keeps RS erasure positions aligned to blocks.
-        return math.ceil(self.block_size / self.colum_byte_num_per_block)
-
+        return ceil_div(self.block_size, self.colum_byte_num_per_block)
 
     def _padded_block_bytes(self, block_id):
-        b = self.block_bytes[block_id]
-        pad = self.colum_num() * self.colum_byte_num_per_block - len(b)
-        return b + bytes(pad) if pad > 0 else b
-
+        return self.block_bytes[block_id].ljust(self.colum_num() * self.colum_byte_num_per_block, b'\0')
 
     def block_bytes_to_colum_bytes(self):
-        if len(self.block_bytes) < self.block_num:
-            self.block_bytes = []
-            self._gen_block_bytes()
-        n = self.colum_byte_num_per_block
-        self.colum_bytes = []
-        for i in range(0, self.colum_num()):
-            self.colum_bytes.append(
-                b''.join(self._padded_block_bytes(j)[i*n:(i+1)*n] for j in range(0, self.block_num)))
+        self.block(0)
+        if len(self.block_bytes) != self.block_num or any(
+            len(block) != self.block_size for block in self.block_bytes
+        ):
+            raise ValueError("blocks do not match the configured geometry")
+        matrix = np.frombuffer(b''.join(self.block_bytes), dtype=np.uint8)
+        matrix = matrix.reshape(self.block_num, self.block_size)
+        if self.block_size % 2:
+            matrix = np.pad(matrix, ((0, 0), (0, 1)))
+        self.colum_bytes = [matrix[:, start:start + 2].tobytes() for start in range(0, matrix.shape[1], 2)]
+        self.colum_rs_codes = []
 
-    def restore_colum_bytes_rs(self, rs_bytes, erasure_positions=[]):
-        self.reset_rs_bytes_with_rs_codes(rs_bytes)
-        for i in range(0, self.colum_num()):
-            int_arr = bytes_to_int_array(self.colum_bytes[i] + self.colum_rs_codes[i], self.colum_byte_num_per_block)
-            dec_obj = self.ecc.decode(int_arr, self.ecc.nsym, erasure_positions)
-            self.colum_bytes[i] = int_array_to_bytes(dec_obj[0], self.colum_byte_num_per_block)
+    def restore_colum_bytes_rs(self, rs_bytes, erasure_positions=()):
+        validate_codeword(self.block_num, self.redundant_block_num)
+        positions = list(erasure_positions)
+        if any(type(pos) is not int or not 0 <= pos < self.block_num for pos in positions):
+            raise ValueError("erasure positions must be valid block indices")
+        if len(set(positions)) != len(positions):
+            raise ValueError("duplicate erasure position")
+        if len(positions) > self.redundant_block_num:
+            raise ReedSolomonError(
+                f"too many erasures: {len(positions)} for {self.redundant_block_num} parity symbols"
+            )
+        parity = self._split_parity(rs_bytes)
+        if not self.colum_bytes:
+            self.block_bytes_to_colum_bytes()
+        if len(self.colum_bytes) != self.colum_num() or any(
+            len(col) != 2 * self.block_num for col in self.colum_bytes
+        ):
+            raise ValueError("columns do not match the configured geometry")
+        if not self.redundant_block_num:
+            return 0
+        restored = []
+        corrected_symbols = 0
+        with _RS_LOCK:
+            codec = self._codec()
+            for column, parity_column in zip(self.colum_bytes, parity):
+                symbols = np.frombuffer(column + parity_column, dtype='>u2').tolist()
+                decoded, _, errata = codec.decode(symbols, erase_pos=positions)
+                restored.append(np.asarray(decoded, dtype='>u2').tobytes())
+                corrected_symbols += len(errata)
+        self.colum_bytes = restored
+        self.colum_rs_codes = parity
+        return corrected_symbols
 
+    def _split_parity(self, rs_bytes):
+        width = self.colum_byte_num_per_block * self.redundant_block_num
+        if len(rs_bytes) != self.colum_num() * width:
+            raise ValueError("Reed–Solomon parity length does not match the configured geometry")
+        return [rs_bytes[i * width:(i + 1) * width] for i in range(self.colum_num())]
 
     def reset_rs_bytes_with_rs_codes(self, rs_bytes):
-        self.colum_rs_codes = []
-        rs_code_len = self.colum_byte_num_per_block * self.redundant_block_num
-        for i in range(0, self.colum_num()):
-            self.colum_rs_codes.append(rs_bytes[i*rs_code_len:(i+1)*rs_code_len])
+        self.colum_rs_codes = self._split_parity(rs_bytes)
 
     def colum_bytes_to_block_bytes(self):
-        n = self.colum_byte_num_per_block
-        for i in range(0, self.block_num):
-            full = b''.join(self.colum_bytes[j][i*n:(i+1)*n] for j in range(0, self.colum_num()))
-            self.block_bytes[i] = full[:self.block_size]   # strip the column padding
+        columns = np.frombuffer(b''.join(self.colum_bytes), dtype=np.uint8)
+        matrix = columns.reshape(self.colum_num(), self.block_num, 2).transpose(1, 0, 2)
+        matrix = matrix.reshape(self.block_num, -1)
+        self.block_bytes = [row[:self.block_size].tobytes() for row in matrix]
 
     def block_seq(self, block_id):
         return bytesToDNA(self.block(block_id))
 
     def get_block_seqs(self):
-        sqs = []
-        for i in range(0, self.block_num):
-            sqs.append(self.block_seq(i))
-        return sqs
+        return [self.block_seq(i) for i in range(self.block_num)]
 
     def write_block_seqs_to_fasta(self, file):
-        # 2020/06/30
-        out = open(file, 'tw')
-        for i in range(0, self.block_num):
-            out.write(">block-" + str(i) + "\n")
-            out.write(self.block_seq(i))
-            out.write("\n")
-        out.close()
+        fasta = ''.join(f">block-{i}\n{self.block_seq(i)}\n" for i in range(self.block_num))
+        write_atomic(file, fasta.encode('ascii'))
 
     def chunk_block_seq(self, chunk_id, block_index):
-        block_id = chunk_id * self.chunk_size + block_index
-        return self.block_seq(block_id)
-
-
-    def __chunk_crc(self):
-        for i in range(0, self.chunk_num):
-            self.chunk_crc_codes[i] = zlib.crc32(self.chunk(i)).to_bytes(4, 'big', signed=False)
-
-    def __block_crc(self):
-            # Rebuilds from scratch; this used to append unconditionally, so any second
-            # call (e.g. a repeated set_chr_seq) doubled the list.
-            self.block_crc_codes = []
-            if self.block_ecc_mode == 'crc8':
-                for i in range(0, self.block_num):
-                    crc8_obj = crc8.crc8()
-                    crc8_obj.update(self.block(i))
-                    self.block_crc_codes.append(crc8_obj.digest())
-            elif self.block_ecc_mode == 'crc16':
-                for i in range(0, self.block_num):
-                    self.block_crc_codes.append(crc16pure.crc16xmodem(self.block(i)).to_bytes(self.block_ecc_byte_num, 'big', signed=False))
-            else:
-                raise ValueError("unknown block_ecc_mode %r" % (self.block_ecc_mode,))
-
-
-
-            # self.block_crc_codes.append(crc16pure.crc16xmodem(self.block(i)).to_bytes(self.block_crc_byte_num, 'big', signed=False))
-            #self.block_crc_codes[i] = crc16pure.crc16xmodem(self.block(i)).to_bytes(2, 'big', signed=False)
-            # print(int.from_bytes(self.block_crc_codes[i],'big', signed=False))
+        return self.block_seq(chunk_id * self.chunk_size + block_index)
 
     def get_chr_md5(self):
+        if self.DNA_seq_bytes_md5 is not None:
+            return self.DNA_seq_bytes_md5
         return md5(self.DNA_seq_bytes).digest()
 
-    # These accessors test "is it already computed?", so they check for None rather than
-    # truthiness: a legitimately all-zero CRC (b'\x00') is falsy and used to force a full
-    # recompute of every code on each call.
     def get_chunk_crc(self, chunk_id):
         if self.chunk_crc_codes[chunk_id] is None:
-            self.__chunk_crc()
+            self.chunk_crc_codes[chunk_id] = zlib.crc32(self.chunk(chunk_id)).to_bytes(4, 'big')
         return self.chunk_crc_codes[chunk_id]
 
-    #def chunk_index(self, ):
-
     def get_block_crc(self, block_id):
-        if len(self.block_crc_codes) < self.block_num:
-            self.__block_crc()
+        if not self.block_crc_codes:
+            self.block_crc_codes = [
+                block_crc(self.block(i), self.block_ecc_mode) for i in range(self.block_num)
+            ]
         return self.block_crc_codes[block_id]
 
-
     def get_colum_rs(self, colum_id):
-        if len(self.colum_rs_codes) <= colum_id:
+        if not self.colum_rs_codes:
             self.__colum_rs()
         return self.colum_rs_codes[colum_id]
 
-
     def __colum_rs(self):
-
-        colum_int_array = []
-        colum_int_array_encode = []
-        colum_bytes = b''
-        self.colum_rs_codes = []
-        #int(self.block_size/self.colum_byte_num_per_block)
-        for i in range(0, self.colum_num()):
-            # print("Block CRC: ", end="")
-            # print(crc16pure.crc16xmodem(self.block(i)))
-            colum_int_array = bytes_to_int_array(self.colum(i), self.colum_byte_num_per_block)
-            colum_int_array_encode = self.ecc.encode(colum_int_array)
-            self.colum_rs_codes.append(int_array_to_bytes(colum_int_array_encode[len(colum_int_array):],  self.colum_byte_num_per_block))
-            #
-
-
-
+        validate_codeword(self.block_num, self.redundant_block_num)
+        if not self.redundant_block_num:
+            self.colum_rs_codes = [b''] * self.colum_num()
+            return
+        if not self.colum_bytes:
+            self.block_bytes_to_colum_bytes()
+        parity = []
+        with _RS_LOCK:
+            codec = self._codec()
+            for column in self.colum_bytes:
+                symbols = np.frombuffer(column, dtype='>u2').tolist()
+                encoded = codec.encode(symbols)
+                parity.append(np.asarray(encoded[self.block_num:], dtype='>u2').tobytes())
+        self.colum_rs_codes = parity
 
     def get_chunk_ecc(self, chunk_id):
-        #anchor 6 bytes
-        #block CRC 2 bytes per block
-        all_ecc_info = b''
-        all_ecc_info = all_ecc_info + self.get_chunk_anchor(chunk_id)
-        for crc in self.get_chunk_block_crc_codes(chunk_id):
-            all_ecc_info = all_ecc_info + crc
-
-        return all_ecc_info
+        return self.get_chunk_anchor(chunk_id) + b''.join(self.get_chunk_block_crc_codes(chunk_id))
 
     def pack_anchor_crc_byte_num(self):
-        a = self.chunk_anchor_byte_num
-        b = self.block_ecc_byte_num
-        ff = (a<<4) + b
-        return ff.to_bytes(1, 'big', signed=False)
-
+        return bytes([(self.chunk_anchor_byte_num << 4) | self.block_ecc_byte_num])
 
     def pack_block_len_chunk_size(self):
-        # 16-bit field: 10 bits block_len, 6 bits chunk_size. Out-of-range values used to
-        # either raise a bare OverflowError (block_len >= 1024) or silently carry into
-        # the block_len bits (chunk_size >= 64, e.g. 500/64 unpacked back as 501/0).
-        block_len = self.block_len
-        chunk_size = self.chunk_size
-        if not 0 <= block_len < 1024:
-            raise ValueError(
-                "block_len must fit in 10 bits (0..1023), got %r" % (block_len,))
-        if not 0 <= chunk_size < 64:
-            raise ValueError(
-                "chunk_size must fit in 6 bits (0..63), got %r" % (chunk_size,))
-        ff = (block_len<<6) + chunk_size
-        return ff.to_bytes(2, 'big', signed=False)
+        if not 0 <= self.block_len < 1024:
+            raise ValueError(f"block_len must fit in 10 bits, got {self.block_len!r}")
+        if not 0 <= self.chunk_size < 64:
+            raise ValueError(f"chunk_size must fit in 6 bits, got {self.chunk_size!r}")
+        return ((self.block_len << 6) | self.chunk_size).to_bytes(2, 'big')
 
     def unpack_block_len_chunk_size(self, packed_bytes=b''):
-
-        ff = int.from_bytes(packed_bytes, "big", signed=False)
-        block_len = ff>>6
-        chunk_size = ff - (block_len<<6)
-        return [block_len, chunk_size]
+        packed = int.from_bytes(packed_bytes, 'big')
+        return [packed >> 6, packed & 63]
 
     def chr_ecc(self):
-        # returns all the required information for recovery of a genome, especially the ECC codes.
-        # The
-        all_ecc_info = []
-
-        all_ecc_info.append(self.DNA_seq_len.to_bytes(4, "big", signed=False))  # genome_size
-        all_ecc_info.append(self.get_chr_md5()) # MD5 of genome bytes self.get_genome_md5()
-        all_ecc_info.append(self.pack_block_len_chunk_size()) #Block_length 10 bits Chunk size 6 bits  pack_anchor_crc_byte_num
-        all_ecc_info.append(self.pack_anchor_crc_byte_num())  # 4 bits each  pack_anchor_crc_byte_num
-        all_ecc_info.append(self.redundant_block_num.to_bytes(2, "big", signed=False)) #RS Redundancy num
-        #
-        for i in range(0, self.chunk_num):
-            all_ecc_info.append(self.get_chunk_ecc(i))
-
-        for i in range(0, self.colum_num()):
-            all_ecc_info.append(self.get_colum_rs(i))
-
-        return all_ecc_info
-
+        if not self.DNA_seq:
+            raise ValueError("load a reference sequence before encoding")
+        validate_geometry(self.block_len, self.chunk_size, self.chunk_anchor_byte_num)
+        if (
+            self.block_size != self.block_len // 4
+            or self.block_num != ceil_div(self.DNA_seq_len, self.block_len)
+            or self.chunk_len != self.block_len * self.chunk_size
+            or self.chunk_num != ceil_div(self.block_num, self.chunk_size)
+            or self.block_ecc_byte_num != CRC_WIDTHS.get(self.block_ecc_mode)
+        ):
+            raise ValueError("chromosome configuration changed without its setter")
+        validate_codeword(self.block_num, self.redundant_block_num)
+        chunks = [self.get_chunk_ecc(i) for i in range(self.chunk_num)]
+        parity = [self.get_colum_rs(i) for i in range(self.colum_num())]
+        chunk_width = self.chunk_anchor_byte_num + self.chunk_size * self.block_ecc_byte_num
+        if any(len(chunk) != chunk_width for chunk in chunks) or any(
+            len(column) != 2 * self.redundant_block_num for column in parity
+        ):
+            raise ValueError("stored checksums or parity do not match the chromosome geometry")
+        return [
+            self.DNA_seq_len.to_bytes(4, 'big'),
+            self.get_chr_md5(),
+            self.pack_block_len_chunk_size(),
+            self.pack_anchor_crc_byte_num(),
+            self.redundant_block_num.to_bytes(2, 'big'),
+            *chunks,
+            *parity,
+        ]
 
     def unpack_ecc_bytes(self, ecc_bytes):
-        #
-        unpacked_ecc = {}
-        unpacked_ecc['genome_length'] = int.from_bytes(ecc_bytes[:4], 'big', signed=False)  #self.DNA_seq_len
-        unpacked_ecc['genome_md5'] = ecc_bytes[4:4+16]
-        unpacked_ecc['block_len'], unpacked_ecc['chunk_size'] = self.unpack_block_len_chunk_size(ecc_bytes[20:22])
-
-        unpacked_ecc['chunk_anchor_byte_num'] = int.from_bytes(ecc_bytes[22:23], 'big', signed=False)
-        unpacked_ecc['chunk_anchor_byte_num'] = unpacked_ecc['chunk_anchor_byte_num']>>4
-        unpacked_ecc['block_crc_byte_num'] = int.from_bytes(ecc_bytes[22:23], 'big', signed=False) - (unpacked_ecc['chunk_anchor_byte_num'] <<4)
-
-
-        #caculating
-        unpacked_ecc['block_size']  = int(unpacked_ecc['block_len']/4)
-        unpacked_ecc['redundant_block_num'] = int.from_bytes(ecc_bytes[23:25], 'big', signed=False)
-        unpacked_ecc['block_num'] = math.ceil(unpacked_ecc['genome_length']/unpacked_ecc['block_len'])
-        unpacked_ecc['chunk_num'] = math.ceil(unpacked_ecc['genome_length']/(unpacked_ecc['block_len'] * unpacked_ecc['chunk_size']))
-
-        chunk_ecc_byte_len = unpacked_ecc['chunk_anchor_byte_num'] + unpacked_ecc['block_crc_byte_num'] * unpacked_ecc['chunk_size']
-        # print(chunk_ecc_byte_len)
-        all_chunk_ecc_bytes = ecc_bytes[25:25+chunk_ecc_byte_len*unpacked_ecc['chunk_num']]
-        all_rs_code_bytes = ecc_bytes[25+chunk_ecc_byte_len*unpacked_ecc['chunk_num']:]
-
-        unpacked_ecc['all_chunk_ecc_bytes'] = all_chunk_ecc_bytes
-        unpacked_ecc['all_rs_code_bytes'] = all_rs_code_bytes
-
-        unpacked_ecc['chunk_objs'] = []
-
-        return unpacked_ecc
-        # chunk_ecc_byte_num =
-        # ck = GenomeChunk(i)
-        # ck.set_block_len(gc.block_len)
-        # ck.chunk_size = gc.chunk_size
-        # # ck.block_len = block_len
-        # ck.block_crc_codes = gc.get_chunk_block_crc_codes(i)
-        # ck.chunk_anchor = gc.chunk(i)[:6]
-
-        # self.block_crc_codes.resize(self.block_num)
-        # self.chunk_crc_codes.resize(self.chunk_num)
-        # self.chunk_anchores.resize(self.chunk_num)
-        # self.__block_crc()
-        # self.__chunk_crc()
-        # self.__encode_chunk_anchores()
-        #
-        # self.redundant_block_num = math.ceil(self.redundant_block_rate * self.block_num)
-        # self.ecc = RSCodec(self.redundant_block_num, nsize=self.nsize)
+        return unpack_chromosome(ecc_bytes)
 
     def reset_with_unpacked_ecc(self, unpacked_ecc):
-        #
-        self.DNA_seq_len = unpacked_ecc['genome_length']
-        genome_md5 = unpacked_ecc['genome_md5']
+        self._clear_sequence()
+        self.DNA_seq_len = 0
         self.block_len = unpacked_ecc['block_len']
         self.chunk_size = unpacked_ecc['chunk_size']
         self.chunk_len = self.block_len * self.chunk_size
-
-        self.block_size  = unpacked_ecc['block_size']
-       # self.chunk_len =
-        self.redundant_block_num = unpacked_ecc['redundant_block_num']
-
-        self.ecc = RSCodec(self.redundant_block_num, nsize=self.nsize)
-        # resetting object
-        self.block_num = math.ceil(self.DNA_seq_len/self.block_len)
-        self.chunk_num = math.ceil(self.DNA_seq_len/self.chunk_len)
-
-        self.block_crc_codes = []
-        # self.chunk_crc_codes.resize(self.chunk_num)
-        # self.chunk_anchores.resize(self.chunk_num)
+        self.block_size = unpacked_ecc['block_size']
+        self.chunk_anchor_byte_num = unpacked_ecc['chunk_anchor_byte_num']
+        self.set_block_ecc_mode(CRC_MODES[unpacked_ecc['block_crc_byte_num']])
+        self._configure(
+            unpacked_ecc['genome_length'], unpacked_ecc['block_num'],
+            unpacked_ecc['redundant_block_num'],
+        )
+        self.DNA_seq_bytes_md5 = unpacked_ecc['genome_md5']
+        self.chunk_crc_codes = [None] * self.chunk_num
+        if "circular" in unpacked_ecc:
+            self.circular_DNA = unpacked_ecc["circular"]
 
     def rebuild_chunk_objs_with_ecc_codes(self, chunk_ecc_bytes):
-        #test =1
-        ck_objs = []
-        chunk_ecc_byte_len = self.chunk_anchor_byte_num + self.block_ecc_byte_num * self.chunk_size
-
-        #Rebuilding genome chunks
-        for i in range(0, self.chunk_num):
-            one_chunk_ecc = chunk_ecc_bytes[i*chunk_ecc_byte_len:(i+1)*chunk_ecc_byte_len]
-            ck = ChromosomeChunk(i)
-            ck.chunk_anchor = one_chunk_ecc[:self.chunk_anchor_byte_num]
-            if i > 0:
-                ck_objs[i-1].next_chunk_anchor = one_chunk_ecc[:self.chunk_anchor_byte_num]
-
-            ck.set_block_len(self.block_len)
-            ck.chunk_size = self.chunk_size
-            ck.block_len = self.block_len
-            ck.chunk_len = self.block_len * self.chunk_size
-            #setting block crc codes
-            for j in range(0, self.chunk_size):
-                self.block_crc_codes.append(one_chunk_ecc[self.chunk_anchor_byte_num+j*self.block_ecc_byte_num:self.chunk_anchor_byte_num + (j + 1) * self.block_ecc_byte_num])
-                ck.block_crc_codes.append(one_chunk_ecc[
-                                            self.chunk_anchor_byte_num + j * self.block_ecc_byte_num:self.chunk_anchor_byte_num + (
-                                                        j + 1) * self.block_ecc_byte_num])
-            ck_objs.append(ck)
-
-        if self.circular_DNA:  #
-            ck_objs[-1].next_chunk_anchor = ck_objs[0].chunk_anchor
-
-        return ck_objs
+        anchor_width, crc_width = self.chunk_anchor_byte_num, self.block_ecc_byte_num
+        width = anchor_width + crc_width * self.chunk_size
+        if len(chunk_ecc_bytes) != width * self.chunk_num:
+            raise ValueError("chunk metadata length does not match the configured geometry")
+        chunks, checksums = [], []
+        for i in range(self.chunk_num):
+            start = i * width
+            anchor = chunk_ecc_bytes[start:start + anchor_width]
+            remaining = self.DNA_seq_len - i * self.chunk_len
+            valid_bases = min(self.chunk_len, remaining)
+            valid_blocks = ceil_div(valid_bases, self.block_len)
+            chunk = ChromosomeChunk(i, anchor, block_len=self.block_len, chunk_size=valid_blocks)
+            chunk.valid_bases = valid_bases
+            chunk.set_ecc_mode(self.block_ecc_mode)
+            chunk.circular = self.circular_DNA
+            start += anchor_width
+            chunk.block_crc_codes = [
+                chunk_ecc_bytes[start + j * crc_width:start + (j + 1) * crc_width]
+                for j in range(valid_blocks)
+            ]
+            if chunks:
+                chunks[-1].next_chunk_anchor = anchor
+                chunks[-1].next_anchor_valid_bases = valid_bases
+            chunks.append(chunk)
+            checksums.extend(chunk.block_crc_codes)
+        if self.circular_DNA and chunks:
+            chunks[-1].next_chunk_anchor = chunks[0].chunk_anchor
+            chunks[-1].next_anchor_valid_bases = chunks[0].valid_bases
+        self.block_crc_codes = checksums
+        self._loaded_anchors = [chunk.chunk_anchor for chunk in chunks]
+        return chunks
 
     def get_all_ecc_bytes(self):
         return b''.join(self.chr_ecc())
 
     def write_ecc_to_file(self, filename):
-        bytes_data = b''.join(self.chr_ecc())
-        with open(filename, "wb") as file:
-            file.write(bytes_data)
-
+        write_atomic(filename, self.get_all_ecc_bytes())
 
     def read_ecc_file(self, filename):
-        with open(filename, "rb") as file:
-            file_bytes = file.read()
-        return file_bytes
-
+        return Path(filename).read_bytes()
 
     def assembled_chr_seq(self):
-        all_bytes = b''
-
-        for i in range(0, self.block_num):
-            all_bytes = all_bytes + self.block_bytes[i]
-
-        return bytesToDNA(all_bytes)[:self.DNA_seq_len]
-
-
-
-
-
-
-
-
-
+        self.block(0)
+        return bytesToDNA(b''.join(self.block_bytes))[:self.DNA_seq_len]

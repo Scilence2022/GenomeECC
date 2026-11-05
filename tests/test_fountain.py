@@ -129,3 +129,68 @@ class TestGlassDecode:
 def test_importing_glass_does_not_change_recursion_limit():
     import sys
     assert sys.getrecursionlimit() < 100000
+
+
+def test_incremental_peeling_and_conflict_detection():
+    decoder = Glass(2)
+    decoder.addDroplet(FakeDroplet([0], b'\x01'))
+    assert not decoder.decode()
+    decoder.addDroplet(FakeDroplet([0, 1], b'\x03'))
+    assert decoder.decode()
+    assert decoder.getString() == b'\x01\x02'
+    with pytest.raises(ValueError, match="conflicting"):
+        decoder.addDroplet(FakeDroplet([0], b'\x10'))
+    assert not decoder.isDone()
+
+
+def test_wire_checks_actual_index_without_mutating_template():
+    from DNAdroplet import DNADroplet
+
+    droplet = DNADroplet(b'abcd', 42)
+    wire = droplet.to_DNA()
+    template = DNADroplet(bytes(4), 42)
+    assert not template.set_droplet_from_DNA('T' + wire[1:])
+    assert not template.set_droplet_from_DNA(wire[:-4])
+    assert template.data == bytes(4)
+    template = DNADroplet(bytes(4))
+    assert template.set_droplet_from_DNA(wire)
+    assert template.index == 42
+    assert template.data == b'abcd'
+
+
+def test_fountain_legacy_schedule_and_wire_vector():
+    from DNAfountain import DNAFountain
+
+    fountain = DNAFountain(b'abcdefghijklmnopqrst', chunk_size=4, seed=11)
+    assert fountain.degrees == [1, 1, 3, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 2, 2]
+    assert fountain.DNAdroplet().to_DNA() == "AAAAAAAAAAAAAAAGCTTCCTTGCTTTCGAAATTCTATCGTCCCTAT"
+
+
+@pytest.mark.parametrize("data", [b'', b'\0', b'ABCDEFG\0xyz\0\0'])
+def test_manifest_fountain_round_trip_with_dropped_strands(data):
+    from fountain_codec import FountainManifest, decode_dna, encode_dna
+
+    manifest, strands = encode_dna(data, 100 if data else 0, chunk_size=3, seed=4)
+    manifest = FountainManifest.from_bytes(manifest.to_bytes())
+    assert decode_dna(manifest, strands[::2]) == data
+    if data:
+        with pytest.raises(ValueError, match="unrecovered"):
+            decode_dna(manifest, [])
+
+
+def test_fountain_filter_has_attempt_limit():
+    from fountain_codec import encode_dna
+
+    with pytest.raises(ValueError, match="budget exhausted"):
+        encode_dna(b'abc', 1, strand_filter=lambda _: False, max_attempts=2)
+
+
+def test_soliton_bounds_and_random_state():
+    from utils import get_degrees
+
+    rng = random.getstate()
+    assert all(probability >= 0 for probability in robust_distribution(50, .01, .9))
+    get_degrees(50, 100, 11)
+    assert random.getstate() == rng
+    with pytest.raises(ValueError, match="failure probability"):
+        robust_distribution(50, .01, 0)
